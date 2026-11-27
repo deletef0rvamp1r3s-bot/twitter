@@ -2,14 +2,14 @@ import sys, asyncio
 if sys.version_info >= (3, 10):
     asyncio.set_event_loop(asyncio.new_event_loop())
 
-import os, re, time, queue, threading, logging
+import os, re, time, queue, threading, subprocess, shutil, logging
 from pyrogram import Client, filters
 from yt_dlp import YoutubeDL
+import imageio_ffmpeg
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("bot")
 
-# 🔑 المفاتيح من متغيرات البيئة
 API_ID = os.environ.get("API_ID")
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -19,14 +19,28 @@ if not (API_ID and API_HASH and BOT_TOKEN):
 tg = Client("twitter_vod_bot", api_id=int(API_ID), api_hash=API_HASH,
             bot_token=BOT_TOKEN, in_memory=True, workers=2)
 
-MAX_SECONDS = 30 * 60          # ⏱ الحد الأقصى: بث 30 دقيقة
-MAX_QUEUE = 3                  # طابور حماية السيرفر
+MAX_SECONDS = 30 * 60
+MAX_QUEUE = 3
 jobs = queue.Queue(maxsize=MAX_QUEUE)
 URL_RE = re.compile(r'https?://(?:www\.)?(?:twitter\.com|x\.com)/\S+', re.I)
 
-HELP = ("⬇️ أرسل لي رابط بث/فيديو من تويتر/X **بعد ما انتهى ونزل كبوست** وسأحمّله وأرسله لك جاهزًا.\n"
-        "⏱ الحد الأقصى للمدة: 30 دقيقة.\n"
-        "مثال: https://x.com/user/status/123456789")
+HELP = ("⬇️ أرسل رابط بث/فيديو من تويتر/X بعد ما انتهى ونزل كبوست وسأحمّله وأرسله سليمًا.\n"
+        "⏱ الحد الأقصى: 30 دقيقة.")
+
+
+def get_ffmpeg():
+    """جهّز ffmpeg باسم قياسي عشان yt-dlp يعرف يلقاه."""
+    ff = imageio_ffmpeg.get_ffmpeg_exe()
+    ffdir = '/tmp/ffbin'
+    os.makedirs(ffdir, exist_ok=True)
+    link = os.path.join(ffdir, 'ffmpeg')
+    if not os.path.exists(link):
+        try:
+            os.symlink(ff, link)
+        except OSError:
+            shutil.copyfile(ff, link)
+            os.chmod(link, 0o755)
+    return ff, ffdir
 
 
 @tg.on_message(filters.command("start"))
@@ -47,7 +61,6 @@ def on_text(c, m):
 
 
 def worker():
-    """تحميل واحد بالمرّة — والباقي بالطابور."""
     while True:
         chat_id, url, notify_id = jobs.get()
         try:
@@ -66,21 +79,16 @@ def download_and_send(chat_id, url, notify_id):
     filepath = None
     sent = False
     try:
-        # 1) فحص الفيديو: مدته وحالته
         tg.edit_message_text(chat_id, notify_id, "🔍 جاري فحص البث...")
-        probe = {'quiet': True, 'no_warnings': True, 'noplaylist': True}
-        with YoutubeDL(probe) as ydl:
+        with YoutubeDL({'quiet': True, 'no_warnings': True, 'noplaylist': True}) as ydl:
             info = ydl.extract_info(url, download=False)
 
-        live_status = info.get('live_status')
+        if info.get('live_status') == 'is_live':
+            raise RuntimeError("البث ما زال مباشرًا ⏺️ أرسل الرابط بعد ما ينتهي وينزل كبوست.")
         duration = info.get('duration') or 0
-
-        if live_status == 'is_live':
-            raise RuntimeError("البث ما زال مباشرًا الآن ⏺️ أرسل الرابط بعد ما ينتهي وينزل كبوست.")
         if duration > MAX_SECONDS:
-            raise RuntimeError(f"المدة {duration // 60} دقيقة — أطول من الحد المسموح (30 دقيقة).")
+            raise RuntimeError(f"المدة {duration // 60} دقيقة — أطول من الحد (30 دقيقة).")
 
-        # 2) التحميل مع شريط تقدم حي
         state = {'last': 0.0}
         def hook(d):
             if d.get('status') != 'downloading':
@@ -95,21 +103,19 @@ def download_and_send(chat_id, url, notify_id):
             speed = (d.get('speed') or 0) / 1e6
             try:
                 tg.edit_message_text(chat_id, notify_id,
-                                     f"⬇️ جاري تحميل البث...\n"
-                                     f"📊 {pct:.1f}%\n"
-                                     f"💾 {done/1e6:.1f} / {total/1e6:.1f} MB\n"
-                                     f"🚀 السرعة: {speed:.2f} MB/s")
+                                     f"⬇️ جاري التحميل...\n📊 {pct:.1f}%\n"
+                                     f"💾 {done/1e6:.1f} / {total/1e6:.1f} MB\n🚀 {speed:.2f} MB/s")
             except Exception:
                 pass
 
+        ff, ffdir = get_ffmpeg()
+        base = f'/tmp/dl_{int(time.time())}_{chat_id}'
         opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'noplaylist': True,
-            'format': 'bv*+ba/b',
-            'merge_output_format': 'mp4',
-            'outtmpl': f'/tmp/dl_{int(time.time())}_{chat_id}.%(ext)s',
-            'concurrent_fragment_downloads': 4,   # 🚀 تسريع تحميل مقاطع HLS
+            'quiet': True, 'no_warnings': True, 'noplaylist': True,
+            'format': 'best',                 # ملف واحد مدمج — بدون فصل صوت/صورة
+            'outtmpl': base + '.%(ext)s',
+            'ffmpeg_location': ffdir,         # 🔑 عشان yt-dlp يخرج mp4 سليم
+            'fragment_retries': 5,
             'progress_hooks': [hook],
         }
         with YoutubeDL(opts) as ydl:
@@ -118,18 +124,28 @@ def download_and_send(chat_id, url, notify_id):
         if not filepath or not os.path.exists(filepath):
             raise RuntimeError("ما لقيت الملف بعد التحميل")
 
+        # 🔧 إعادة تغليف أخيرة: أبعاد سليمة + faststart لتشغيل فوري
+        clean = base + '_clean.mp4'
+        try:
+            subprocess.run([ff, '-y', '-loglevel', 'error', '-i', filepath,
+                            '-c', 'copy', '-movflags', '+faststart', clean],
+                           check=True, timeout=900)
+            os.remove(filepath)
+            filepath = clean
+        except Exception as e:
+            logger.warning(f"remux failed, keeping original: {e}")
+
         size = os.path.getsize(filepath)
         if size < 50_000:
             raise RuntimeError("الملف فاضي أو تالف")
         if size > 1_900_000_000:
             raise RuntimeError("حجم الملف أكبر من حد تليجرام (2GB)")
 
-        # 3) الرفع ثم التنظيف
-        tg.edit_message_text(chat_id, notify_id, f"📤 جاري رفع البث ({size/1e6:.1f} MB)...")
-        tg.send_video(chat_id, filepath,
+        tg.edit_message_text(chat_id, notify_id, f"📤 جاري الرفع ({size/1e6:.1f} MB)...")
+        tg.send_video(chat_id, filepath, supports_streaming=True,
                       caption=f"⏺️ البث بعد انتهاءه — المدة: {duration // 60} دقيقة")
         sent = True
-        tg.edit_message_text(chat_id, notify_id, "✅ تم تحميل البث وإرساله!")
+        tg.edit_message_text(chat_id, notify_id, "✅ تم التحميل والإرسال!")
     finally:
         if not sent and filepath and os.path.exists(filepath):
             try:
@@ -143,7 +159,7 @@ if __name__ == "__main__":
 
     async def main():
         await tg.start()
-        logger.info("🤖 بوت تحميل بثوث تويتر (VOD) شغال الآن — حد 30 دقيقة.")
+        logger.info("🤖 بوت تحميل بثوث تويتر (VOD) — نسخة مصححة.")
         await asyncio.Event().wait()
 
     loop = asyncio.get_event_loop()

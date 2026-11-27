@@ -25,7 +25,7 @@ jobs = queue.Queue(maxsize=MAX_QUEUE)
 URL_RE = re.compile(r'https?://(?:www\.)?(?:twitter\.com|x\.com)/\S+', re.I)
 
 HELP = ("⬇️ أرسل رابط بث/فيديو من تويتر/X بعد ما انتهى ونزل كبوست.\n"
-        "⏱ الحد الأقصى: 30 دقيقة.\n📐 الأبعاد: نفس الأصل بالضبط بدون تمدد.")
+        "⏱ الحد الأقصى: 30 دقيقة.\n📐 الأبعاد: نفس الأصل بدون تمدد.")
 
 
 def get_ffmpeg():
@@ -43,7 +43,6 @@ def get_ffmpeg():
 
 
 def probe(ff, path):
-    """اقرأ الأبعاد الحقيقية للملف المنزّل."""
     r = subprocess.run([ff, '-i', path], capture_output=True, text=True)
     err = r.stderr or ''
     m = re.search(r'Stream.*Video:.*?(\d{2,5})x(\d{2,5})', err)
@@ -92,13 +91,12 @@ def download_and_send(chat_id, url, notify_id):
 
         if info.get('live_status') == 'is_live':
             raise RuntimeError("البث ما زال مباشرًا ⏺️ أرسل الرابط بعد ما ينتهي وينزل كبوست.")
-        duration = info.get('duration') or 0
+        duration = int(info.get('duration') or 0)
         if duration > MAX_SECONDS:
             raise RuntimeError(f"المدة {duration // 60} دقيقة — أطول من الحد (30 دقيقة).")
 
-        # 📐 الأبعاد الأصلية المعلنة من X — هذي مرجعنا الوحيد
-        src_w = info.get('width') or 0
-        src_h = info.get('height') or 0
+        src_w = int(info.get('width') or 0)
+        src_h = int(info.get('height') or 0)
 
         state = {'last': 0.0}
         def hook(d):
@@ -135,27 +133,24 @@ def download_and_send(chat_id, url, notify_id):
         if not filepath or not os.path.exists(filepath):
             raise RuntimeError("ما لقيت الملف بعد التحميل")
 
-        # 🔧 المطابقة الجذرية للأبعاد
         clean = base + '_clean.mp4'
         fw, fh = probe(ff, filepath)
         tg.edit_message_text(chat_id, notify_id, f"🔧 مطابقة الأبعاد الأصلية ({src_w}x{src_h})...")
 
         if src_w and src_h and (fw, fh) != (src_w, src_h):
-            # تعارض أبعاد → نجبر أبعاد الأصل بالضبط + حواف سوداء بدل التمدد (استحالة سترچ)
             vf = (f"scale={src_w}:{src_h}:force_original_aspect_ratio=decrease,"
                   f"pad={src_w}:{src_h}:(ow-iw)/2:(oh-ih)/2,setsar=1")
             cmd = [ff, '-y', '-loglevel', 'error', '-i', filepath, '-vf', vf,
                    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
                    '-c:a', 'copy', '-movflags', '+faststart', clean]
         else:
-            # الأبعاد سليمة → نسخ سريع بدون إعادة ترميز + faststart
             cmd = [ff, '-y', '-loglevel', 'error', '-i', filepath,
                    '-c', 'copy', '-movflags', '+faststart', clean]
         subprocess.run(cmd, check=True, timeout=1800)
         os.remove(filepath)
         filepath = clean
 
-        out_w, out_h = (src_w, src_h) if src_w and src_h else (fw, fh)
+        out_w, out_h = (src_w, src_h) if (src_w and src_h) else (fw, fh)
         size = os.path.getsize(filepath)
         if size < 50_000:
             raise RuntimeError("الملف فاضي أو تالف")
@@ -163,12 +158,25 @@ def download_and_send(chat_id, url, notify_id):
             raise RuntimeError("حجم الملف أكبر من حد تليجرام (2GB)")
 
         tg.edit_message_text(chat_id, notify_id, f"📤 جاري الرفع ({size/1e6:.1f} MB)...")
-        # 📐 نخبر تليجرام بالأبعاد صراحةً عشان ما يجتهد من عنده
-        tg.send_video(chat_id, filepath,
-                      width=out_w, height=out_h,
-                      duration=int(duration) or None,
-                      supports_streaming=True,
-                      caption=f"⏺️ البث بعد انتهاءه — {out_w}x{out_h} — المدة: {duration // 60} دقيقة")
+
+        cap = "⏺️ البث بعد انتهاءه"
+        if out_w and out_h:
+            cap += f" — {out_w}x{out_h}"
+        if duration:
+            cap += f" — المدة: {duration // 60} دقيقة"
+
+        # ✅ إرسال آمن: ميتاداتا صحيحة دائمًا (أرقام، ما فيه None أبدًا)
+        send_kwargs = {'supports_streaming': True, 'caption': cap,
+                       'duration': duration if duration > 0 else 0}
+        if out_w and out_h:
+            send_kwargs['width'] = out_w
+            send_kwargs['height'] = out_h
+        try:
+            tg.send_video(chat_id, filepath, **send_kwargs)
+        except Exception as e:
+            # 🛡️ شبكة أمان: إذا انهار الإرسال بالميتاداتا، أرسل بدونها
+            logger.warning(f"send with metadata failed ({e}), retrying plain...")
+            tg.send_video(chat_id, filepath, caption=cap)
         sent = True
         tg.edit_message_text(chat_id, notify_id, "✅ تم التحميل والإرسال بأبعاد الأصل!")
     finally:
@@ -184,7 +192,7 @@ if __name__ == "__main__":
 
     async def main():
         await tg.start()
-        logger.info("🤖 بوت تحميل بثوث تويتر — نسخة الأبعاد المضمونة.")
+        logger.info("🤖 بوت تحميل بثوث تويتر — نسخة الإرسال الآمن.")
         await asyncio.Event().wait()
 
     loop = asyncio.get_event_loop()
